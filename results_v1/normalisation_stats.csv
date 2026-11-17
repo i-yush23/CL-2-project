@@ -1,0 +1,6 @@
+metric,value
+variant_groups,5300
+train_tokens_total,365560
+train_tokens_changed,70484
+dev_tokens_total,78678
+dev_tokens_changed,14850

@@ -11,6 +11,8 @@ __pycache__/
 
 # Experiment cache
 results/cache/
+results_v1/cache/
+results_smoke/
 
 # External cloned repositories
 external/
