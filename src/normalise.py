@@ -2,6 +2,9 @@ import re
 import json
 import os
 import sys
+import hashlib
+import random
+import difflib
 from collections import defaultdict, Counter
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -10,17 +13,27 @@ if PROJECT_ROOT not in sys.path:
 
 from src.cl1 import get_phonetic_hash, load_transliteration_variants, load_slang_map
 
+# ── Named constants for variant dictionary building ──────────────────────────
+MIN_CANON_FREQ = 3       # canonical must appear at least this many times
+MIN_VARIANT_FREQ = 2     # variant must appear at least this many times
+MIN_TOKEN_LEN = 3        # minimum length for source and canonical
+HIN_SHARE_MIN = 0.8      # form must have >= this Hin share to qualify
+ENG_SHARE_MAX = 0.1      # form must have <= this Eng share to qualify
+ENG_BLOCKLIST_THRESH = 0.3  # forms with Eng share >= this are blocklisted
+SIMILARITY_MIN = 0.7     # difflib ratio threshold between source and canonical
+SEED = 42
+
+# ── Regexes ──────────────────────────────────────────────────────────────────
 URL_RE = re.compile(r'https?://\S+|www\.\S+')
 MENTION_RE = re.compile(r'@\w+')
 HASHTAG_RE = re.compile(r'^#(.+)$')
-ELONGATION_RE = re.compile(r'(.)\1{2,}')  # 3+ repeats -> 2 (keep at most 2)
+LETTER_ELONGATION_RE = re.compile(r'([a-zA-Z])\1{2,}')  # only ASCII letters
 
 
 def clean_token(tok: str) -> str:
-    """
-    Lowercase, map URLs -> <url>, @mentions -> <user>,
-    strip '#' from hashtags, collapse elongations (3+ chars to 2).
-    Emoji are left untouched (they are not purely alpha so the regex is safe).
+    """Clean a single token: lowercase, URLs, mentions, hashtags, elongation.
+
+    Elongation collapsing applies only to ASCII letters (not digits/emoji/punct).
     """
     if URL_RE.fullmatch(tok):
         return '<url>'
@@ -29,96 +42,173 @@ def clean_token(tok: str) -> str:
     m = HASHTAG_RE.match(tok)
     if m:
         tok = m.group(1)
-    # Lowercase before elongation so case doesn't prevent collapsing
     tok = tok.lower()
-    # Collapse 3+ identical consecutive characters to 2
-    tok = ELONGATION_RE.sub(r'\1\1', tok)
+    tok = LETTER_ELONGATION_RE.sub(r'\1\1', tok)
     return tok
 
 
-def _majority_tag(tag_list: list[str]) -> str:
-    """Return the most common tag in a list."""
-    return Counter(tag_list).most_common(1)[0][0]
+def _compute_tag_shares(train_tweets: list[dict]) -> dict[str, dict[str, float]]:
+    """Compute per-form tag shares over all train occurrences.
 
-
-def build_variant_dictionary(train_tweets: list[dict]) -> dict[str, str]:
+    Returns {form: {'Hin': share, 'Eng': share, ...}}.
     """
-    Build a canonical-form dictionary from train tweets only.
-
-    Strategy:
-    1. For each train token, group by its phonetic hash.
-    2. Within each group, only merge tokens whose majority gold tag is 'Hin'.
-       (Never merge English forms into Hindi canonical forms.)
-    3. The canonical form is the most frequent surface form in the group.
-    4. Merge in CL-1 transliteration_variants.json and slang_map.json
-       as background, only where there is no learned entry for the same key.
-
-    Returns: dict mapping lowercase surface form -> canonical lowercase form.
-    """
-    # Gather (cleaned_token, gold_tag) pairs from train
-    hash_to_tokens: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    form_tag_counts: dict[str, Counter] = defaultdict(Counter)
     for tweet in train_tweets:
         for tok, tag in zip(tweet['tokens'], tweet['tags']):
             cleaned = clean_token(tok)
-            if not cleaned or cleaned in ('<url>', '<user>'):
-                continue
-            if not cleaned.isalpha():
-                continue  # Skip punctuation, numbers, emoji
-            hash_to_tokens[get_phonetic_hash(cleaned)].append((cleaned, tag))
+            if cleaned and cleaned not in ('<url>', '<user>') and cleaned.isalpha():
+                form_tag_counts[cleaned][tag] += 1
+
+    shares = {}
+    for form, counts in form_tag_counts.items():
+        total = sum(counts.values())
+        shares[form] = {tag: cnt / total for tag, cnt in counts.items()}
+    return shares
+
+
+def _passes_hin_guard(form: str, tag_shares: dict) -> bool:
+    """Check if a form passes the Hindi guard for variant dictionary."""
+    if form not in tag_shares:
+        return False
+    shares = tag_shares[form]
+    return (shares.get('Hin', 0) >= HIN_SHARE_MIN and
+            shares.get('Eng', 0) <= ENG_SHARE_MAX)
+
+
+def _is_eng_blocklisted(form: str, tag_shares: dict) -> bool:
+    """Check if a form is blocklisted due to high English share."""
+    if form not in tag_shares:
+        return False
+    return tag_shares[form].get('Eng', 0) >= ENG_BLOCKLIST_THRESH
+
+
+def _resolve_chains(d: dict[str, str]) -> dict[str, str]:
+    """Resolve transitive chains to fixed point with cycle guard."""
+    # Find cycles and assign canonical representative
+    canonical_repr = {}
+    for k in list(d.keys()):
+        curr = k
+        path = []
+        while curr in d and curr not in path:
+            path.append(curr)
+            curr = d[curr]
+        if curr in path:
+            idx = path.index(curr)
+            cycle = path[idx:]
+            canon = min(cycle)
+            for node in cycle:
+                canonical_repr[node] = canon
+
+    # Trace each key to terminal target or cycle canonical
+    resolved = {}
+    for k in d:
+        curr = k
+        visited = set()
+        while curr in d and curr not in visited:
+            visited.add(curr)
+            if curr in canonical_repr:
+                curr = canonical_repr[curr]
+                break
+            curr = d[curr]
+        if curr in canonical_repr:
+            curr = canonical_repr[curr]
+        if k != curr:
+            resolved[k] = curr
+
+    # Final pass: ensure target is not itself mapped
+    for k, v in list(resolved.items()):
+        target = v
+        visited = {k}
+        while target in resolved and target not in visited:
+            visited.add(target)
+            target = resolved[target]
+        resolved[k] = target
+
+    resolved = {k: v for k, v in resolved.items() if k != v}
+
+    for k, v in resolved.items():
+        assert resolved.get(v, v) == v, f"Chain not resolved: {k} -> {v} -> {resolved.get(v, v)}"
+    return resolved
+
+
+def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], dict[str, int]]:
+    """Build canonical-form dictionary from train tweets only.
+
+    Returns (variant_dict, rejection_counts) where rejection_counts
+    tracks CL-1 rejections by reason.
+    """
+    tag_shares = _compute_tag_shares(train_tweets)
+
+    # Group tokens by phonetic hash
+    hash_to_forms: dict[str, Counter] = defaultdict(Counter)
+    for tweet in train_tweets:
+        for tok, tag in zip(tweet['tokens'], tweet['tags']):
+            cleaned = clean_token(tok)
+            if (cleaned and cleaned not in ('<url>', '<user>') and
+                    cleaned.isalpha() and len(cleaned) >= MIN_TOKEN_LEN):
+                hash_to_forms[get_phonetic_hash(cleaned)][cleaned] += 1
 
     learned: dict[str, str] = {}
-    MIN_FREQ = 3        # canonical must appear at least this many times
-    MIN_VARIANT_FREQ = 2  # variant must appear at least this many times
 
-    for ph, token_tag_pairs in hash_to_tokens.items():
-        if len(token_tag_pairs) < 2:
+    for ph, form_counts in hash_to_forms.items():
+        # Filter to forms passing Hin guard with minimum frequency
+        passing = {f: c for f, c in form_counts.items()
+                   if _passes_hin_guard(f, tag_shares) and
+                   not _is_eng_blocklisted(f, tag_shares) and
+                   c >= MIN_VARIANT_FREQ}
+        if len(passing) < 2:
             continue
-        # Determine majority tag for each distinct surface form
-        form_tags: dict[str, list[str]] = defaultdict(list)
-        for form, tag in token_tag_pairs:
-            form_tags[form].append(tag)
 
-        # Keep only forms with majority Hin tag and minimum frequency
-        hin_forms = {f: tags for f, tags in form_tags.items()
-                     if _majority_tag(tags) == 'Hin' and len(tags) >= MIN_VARIANT_FREQ}
-        if len(hin_forms) < 2:
-            continue  # Need 2+ Hin variants to merge
+        # Canonical = most frequent passing form
+        canonical = max(passing, key=lambda f: passing[f])
+        if passing[canonical] < MIN_CANON_FREQ:
+            continue
+        if len(canonical) < MIN_TOKEN_LEN:
+            continue
 
-        # Pick canonical = most frequent Hin form with minimum frequency
-        form_freq = Counter({f: len(tags) for f, tags in hin_forms.items()})
-        canonical, canon_freq = form_freq.most_common(1)[0]
-        if canon_freq < MIN_FREQ:
-            continue  # Skip if canonical is too rare
+        for form in passing:
+            if form == canonical:
+                continue
+            if len(form) < MIN_TOKEN_LEN:
+                continue
+            # Similarity check
+            ratio = difflib.SequenceMatcher(None, form, canonical).ratio()
+            if ratio < SIMILARITY_MIN:
+                continue
+            learned[form] = canonical
 
-        for form in hin_forms:
-            if form != canonical:
-                learned[form] = canonical
-
-    # Load CL-1 background dictionaries
+    # Load CL-1 background dictionaries with guards
     cl1_variants = load_transliteration_variants()
     cl1_slang = load_slang_map()
+    rejections: dict[str, int] = defaultdict(int)
 
-    # Merge background: add CL-1 entries only where learned has no entry
-    for src, tgt in cl1_variants.items():
-        if src not in learned:
-            learned[src] = tgt
-    for src, tgt in cl1_slang.items():
-        if src not in learned:
+    for label, cl1_dict in [('cl1_variants', cl1_variants), ('cl1_slang', cl1_slang)]:
+        for src, tgt in cl1_dict.items():
+            if src in learned:
+                rejections[f'{label}_already_learned'] += 1
+                continue
+            if _is_eng_blocklisted(src, tag_shares):
+                rejections[f'{label}_src_eng_majority'] += 1
+                continue
+            if tgt in tag_shares and not _passes_hin_guard(tgt, tag_shares):
+                rejections[f'{label}_tgt_fails_hin_guard'] += 1
+                continue
             learned[src] = tgt
 
-    return learned
+    # Resolve chains
+    learned = _resolve_chains(learned)
+
+    return learned, dict(rejections)
 
 
 def normalise_tokens(tokens: list[str], variant_dict: dict[str, str]) -> list[str]:
-    """
-    Return normalised tokens, strictly 1-to-1 with input (never split/merge).
-    For each token: clean it, then look up in variant_dict.
-    """
+    """Return normalised tokens, strictly 1-to-1 with input."""
     out = []
     for tok in tokens:
         cleaned = clean_token(tok)
         normalised = variant_dict.get(cleaned, cleaned)
         out.append(normalised)
+    assert len(out) == len(tokens), "normalise_tokens must be 1-to-1"
     return out
 
 
@@ -126,12 +216,11 @@ def compute_normalisation_stats(
     train_tweets: list[dict],
     dev_tweets: list[dict],
     variant_dict: dict[str, str],
+    rejections: dict[str, int],
 ) -> dict:
-    """
-    Count how many tokens changed on train and dev sets.
-    Returns dict with keys: variant_groups, train_changed, dev_changed.
-    """
-    variant_groups = len(variant_dict)
+    """Compute normalisation statistics excluding case-only changes."""
+    entries = len(variant_dict)
+    distinct_canonicals = len(set(variant_dict.values()))
 
     def count_changes(tweets):
         total, changed = 0, 0
@@ -139,22 +228,27 @@ def compute_normalisation_stats(
             for tok in tweet['tokens']:
                 total += 1
                 cleaned = clean_token(tok)
-                if variant_dict.get(cleaned, cleaned) != cleaned:
+                normalised = variant_dict.get(cleaned, cleaned)
+                # Exclude case-only changes
+                if normalised != cleaned and normalised.lower() != cleaned.lower():
                     changed += 1
         return total, changed
 
     train_total, train_changed = count_changes(train_tweets)
     dev_total, dev_changed = count_changes(dev_tweets)
     return {
-        'variant_groups': variant_groups,
+        'entries': entries,
+        'distinct_canonicals': distinct_canonicals,
         'train_total': train_total,
         'train_changed': train_changed,
         'dev_total': dev_total,
         'dev_changed': dev_changed,
+        'rejections': rejections,
     }
 
 
-def save_variant_dict(variant_dict: dict[str, str], path: str = "results/variant_dict.json") -> None:
+def save_variant_dict(variant_dict: dict[str, str],
+                      path: str = "results/variant_dict.json") -> None:
     """Save variant dictionary to JSON."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
@@ -166,49 +260,59 @@ def save_normalisation_stats(
     variant_dict: dict[str, str],
     path: str = "results/normalisation_stats.csv",
 ) -> None:
-    """Save normalisation stats CSV with 20 example variant groups."""
+    """Save normalisation stats and 20 seeded-random example groups."""
     import pandas as pd
-    rows = []
-    rows.append({
-        'metric': 'variant_groups',
-        'value': stats['variant_groups'],
-    })
-    rows.append({
-        'metric': 'train_tokens_total',
-        'value': stats['train_total'],
-    })
-    rows.append({
-        'metric': 'train_tokens_changed',
-        'value': stats['train_changed'],
-    })
-    rows.append({
-        'metric': 'dev_tokens_total',
-        'value': stats['dev_total'],
-    })
-    rows.append({
-        'metric': 'dev_tokens_changed',
-        'value': stats['dev_changed'],
-    })
+    rows = [
+        {'metric': 'entries', 'value': stats['entries']},
+        {'metric': 'distinct_canonicals', 'value': stats['distinct_canonicals']},
+        {'metric': 'train_tokens_total', 'value': stats['train_total']},
+        {'metric': 'train_tokens_changed', 'value': stats['train_changed']},
+        {'metric': 'dev_tokens_total', 'value': stats['dev_total']},
+        {'metric': 'dev_tokens_changed', 'value': stats['dev_changed']},
+    ]
+    for reason, cnt in sorted(stats.get('rejections', {}).items()):
+        rows.append({'metric': f'cl1_rejection_{reason}', 'value': cnt})
 
     df_stats = pd.DataFrame(rows)
-    example_rows = [{'source': k, 'canonical': v}
-                    for k, v in list(variant_dict.items())[:20]]
-    df_examples = pd.DataFrame(example_rows)
-
     os.makedirs(os.path.dirname(path), exist_ok=True)
     df_stats.to_csv(path, index=False)
+
+    # 20 seeded-random groups (canonical -> members)
+    groups: dict[str, list[str]] = defaultdict(list)
+    for src, tgt in variant_dict.items():
+        groups[tgt].append(src)
+
+    rng = random.Random(SEED)
+    group_keys = sorted(groups.keys())
+    sampled = rng.sample(group_keys, min(20, len(group_keys)))
+
+    example_rows = []
+    for canon in sampled:
+        members = sorted(groups[canon])
+        example_rows.append({
+            'canonical': canon,
+            'members': ', '.join(members),
+            'member_count': len(members),
+        })
+    df_examples = pd.DataFrame(example_rows)
     example_path = path.replace('.csv', '_examples.csv')
     df_examples.to_csv(example_path, index=False)
     print("Stats:\n", df_stats.to_string(index=False))
-    print("\n20 example variant entries:\n", df_examples.head(20).to_string(index=False))
+    print(f"\n20 random example groups:\n", df_examples.to_string(index=False))
+
+
+def get_cache_key(smoke: bool = False) -> str:
+    """Hash of normalisation constants + smoke flag for cache keying."""
+    key_str = f"{MIN_CANON_FREQ}_{MIN_VARIANT_FREQ}_{MIN_TOKEN_LEN}_{HIN_SHARE_MIN}_{ENG_SHARE_MAX}_{ENG_BLOCKLIST_THRESH}_{SIMILARITY_MIN}_{smoke}"
+    return hashlib.md5(key_str.encode()).hexdigest()[:8]
 
 
 if __name__ == "__main__":
     from src.data_io import load_dataset
     train_tweets, dev_tweets = load_dataset()
     print("Building variant dictionary from train only...")
-    variant_dict = build_variant_dictionary(train_tweets)
+    variant_dict, rejections = build_variant_dictionary(train_tweets)
     save_variant_dict(variant_dict)
     print(f"Variant dictionary has {len(variant_dict)} entries.")
-    stats = compute_normalisation_stats(train_tweets, dev_tweets, variant_dict)
+    stats = compute_normalisation_stats(train_tweets, dev_tweets, variant_dict, rejections)
     save_normalisation_stats(stats, variant_dict)

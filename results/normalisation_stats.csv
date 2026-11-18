@@ -1,6 +1,13 @@
 metric,value
-variant_groups,5300
+entries,2039
+distinct_canonicals,764
 train_tokens_total,365560
-train_tokens_changed,70484
+train_tokens_changed,23031
 dev_tokens_total,78678
-dev_tokens_changed,14850
+dev_tokens_changed,4845
+cl1_rejection_cl1_slang_already_learned,1
+cl1_rejection_cl1_slang_src_eng_majority,23
+cl1_rejection_cl1_slang_tgt_fails_hin_guard,14
+cl1_rejection_cl1_variants_already_learned,17
+cl1_rejection_cl1_variants_src_eng_majority,15
+cl1_rejection_cl1_variants_tgt_fails_hin_guard,3

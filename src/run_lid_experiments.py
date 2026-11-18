@@ -18,7 +18,12 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import pandas as pd
 
 from src.data_io import load_dataset
-from src.normalise import clean_token, build_variant_dictionary, normalise_tokens
+from src.normalise import (
+    clean_token,
+    build_variant_dictionary,
+    normalise_tokens,
+    get_cache_key,
+)
 from src.lid import (
     NaiveBayesLID,
     TAG_MAP,
@@ -47,7 +52,9 @@ def add_cleaned_tokens(tweets: list[dict]) -> None:
 def add_normalised_tokens(tweets: list[dict], variant_dict: dict) -> None:
     """Add 'normalised_tokens' field to each tweet in-place."""
     for tweet in tweets:
-        tweet['normalised_tokens'] = normalise_tokens(tweet['tokens'], variant_dict)
+        normed = normalise_tokens(tweet['tokens'], variant_dict)
+        assert len(normed) == len(tweet['tokens']), "Length mismatch in normalise_tokens"
+        tweet['normalised_tokens'] = normed
 
 
 def flatten_gold_labels(tweets: list[dict]) -> list[str]:
@@ -65,7 +72,8 @@ def run_condition(
     """Train LID, evaluate on dev, save results. Returns metrics dict."""
     print(f"\n--- Condition: {name} (tokens_key={tokens_key}) ---")
 
-    model_path = os.path.join(CACHE_DIR, f"lid_{name}.pkl")
+    cache_key = get_cache_key(smoke_test)
+    model_path = os.path.join(CACHE_DIR, f"lid_{name}_{cache_key}.pkl")
 
     if os.path.exists(model_path):
         print("  Loading cached model...")
@@ -118,14 +126,15 @@ def main(smoke_test: bool = False) -> None:
     add_cleaned_tokens(dev_tweets)
 
     print("Building variant dictionary (train only)...")
-    variant_dict_path = os.path.join(CACHE_DIR, "variant_dict.pkl")
+    cache_key = get_cache_key(smoke_test)
+    variant_dict_path = os.path.join(CACHE_DIR, f"variant_dict_{cache_key}.pkl")
     if os.path.exists(variant_dict_path):
         with open(variant_dict_path, 'rb') as f:
             import pickle
             variant_dict = pickle.load(f)
         print(f"  Loaded cached variant dict ({len(variant_dict)} entries).")
     else:
-        variant_dict = build_variant_dictionary(train_tweets)
+        variant_dict, _ = build_variant_dictionary(train_tweets)
         with open(variant_dict_path, 'wb') as f:
             import pickle
             pickle.dump(variant_dict, f)
@@ -145,7 +154,8 @@ def main(smoke_test: bool = False) -> None:
     ]:
         # Clear cache for smoke test to retrain on subset
         if smoke_test:
-            model_path = os.path.join(CACHE_DIR, f"lid_{name}.pkl")
+            cache_key = get_cache_key(smoke_test)
+            model_path = os.path.join(CACHE_DIR, f"lid_{name}_{cache_key}.pkl")
             if os.path.exists(model_path):
                 os.remove(model_path)
 
