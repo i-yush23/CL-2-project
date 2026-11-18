@@ -16,11 +16,15 @@ from src.cl1 import get_phonetic_hash, load_transliteration_variants, load_slang
 # ── Named constants for variant dictionary building ──────────────────────────
 MIN_CANON_FREQ = 3       # canonical must appear at least this many times
 MIN_VARIANT_FREQ = 2     # variant must appear at least this many times
+MIN_FREQ_RATIO = 5       # canonical frequency must be >= 5 * source frequency
 MIN_TOKEN_LEN = 3        # minimum length for source and canonical
 HIN_SHARE_MIN = 0.8      # form must have >= this Hin share to qualify
 ENG_SHARE_MAX = 0.1      # form must have <= this Eng share to qualify
 ENG_BLOCKLIST_THRESH = 0.3  # forms with Eng share >= this are blocklisted
 SIMILARITY_MIN = 0.7     # difflib ratio threshold between source and canonical
+ALLOW_SHORT = {"kr", "jb", "kb", "pr", "pe", "naa", "hn"}
+CL1_EXPLICIT_DROP = {"masti", "mast", "ayyo", "imho", "brb", "lmao", "asap", "q", "k", "h", "ha"}
+BLOCKED_MERGES = {('pyaar', 'par'), ('pyar', 'par'), ('haan', 'hain'), ('khana', 'kahan'), ('jane', 'jaan')}
 SEED = 42
 
 # ── Regexes ──────────────────────────────────────────────────────────────────
@@ -171,6 +175,11 @@ def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], 
                 continue
             if len(form) < MIN_TOKEN_LEN:
                 continue
+            # Frequency guard: canonical frequency must dominate source frequency
+            if passing[canonical] < MIN_FREQ_RATIO * passing[form]:
+                continue
+            if (form, canonical) in BLOCKED_MERGES:
+                continue
             # Similarity check
             ratio = difflib.SequenceMatcher(None, form, canonical).ratio()
             if ratio < SIMILARITY_MIN:
@@ -187,10 +196,25 @@ def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], 
             if src in learned:
                 rejections[f'{label}_already_learned'] += 1
                 continue
+            if src in CL1_EXPLICIT_DROP or tgt in CL1_EXPLICIT_DROP:
+                rejections[f'{label}_explicit_drop'] += 1
+                continue
+            # Min length 3 applies unless in ALLOW_SHORT
+            if len(src) < MIN_TOKEN_LEN and src not in ALLOW_SHORT:
+                rejections[f'{label}_src_too_short'] += 1
+                continue
+            if len(tgt) < MIN_TOKEN_LEN and tgt not in ALLOW_SHORT:
+                rejections[f'{label}_tgt_too_short'] += 1
+                continue
+            # Target must be single alphabetic token with no spaces
+            if ' ' in tgt or not tgt.isalpha():
+                rejections[f'{label}_tgt_not_single_alpha'] += 1
+                continue
             if _is_eng_blocklisted(src, tag_shares):
                 rejections[f'{label}_src_eng_majority'] += 1
                 continue
-            if tgt in tag_shares and not _passes_hin_guard(tgt, tag_shares):
+            # Target must pass the same Hin-share guard as learned entries
+            if not _passes_hin_guard(tgt, tag_shares):
                 rejections[f'{label}_tgt_fails_hin_guard'] += 1
                 continue
             learned[src] = tgt
@@ -303,7 +327,7 @@ def save_normalisation_stats(
 
 def get_cache_key(smoke: bool = False) -> str:
     """Hash of normalisation constants + smoke flag for cache keying."""
-    key_str = f"{MIN_CANON_FREQ}_{MIN_VARIANT_FREQ}_{MIN_TOKEN_LEN}_{HIN_SHARE_MIN}_{ENG_SHARE_MAX}_{ENG_BLOCKLIST_THRESH}_{SIMILARITY_MIN}_{smoke}"
+    key_str = f"{MIN_CANON_FREQ}_{MIN_VARIANT_FREQ}_{MIN_FREQ_RATIO}_{MIN_TOKEN_LEN}_{HIN_SHARE_MIN}_{ENG_SHARE_MAX}_{ENG_BLOCKLIST_THRESH}_{SIMILARITY_MIN}_{smoke}"
     return hashlib.md5(key_str.encode()).hexdigest()[:8]
 
 

@@ -30,11 +30,21 @@ BAD_MERGES = [
     ('do', 'diya'), ('he', 'hai'), ('hi', 'hai'),
     ('men', 'main'), ('too', 'tu'), ('jao', 'ji'),
     ('kya', 'ki'), ('mudde', 'modi'),
+    ('pyaar', 'par'), ('haan', 'hain'), ('khana', 'kahan'), ('jane', 'jaan'),
 ]
 for src, tgt in BAD_MERGES:
     actual = vd.get(src)
     assert actual != tgt, f"Bad merge still present: {src} -> {tgt}"
-print("PASS: I1 bad merges absent")
+
+DROPPED_WORDS = ['masti', 'mast', 'ayyo', 'imho', 'brb', 'lmao', 'asap', 'q', 'k', 'h', 'ha']
+for w in DROPPED_WORDS:
+    assert w not in vd, f"Dropped word still in dict keys: {w}"
+
+for k, v in vd.items():
+    assert ' ' not in v, f"Canonical contains a space: {k} -> {v}"
+    assert v.isalpha(), f"Canonical is not alphabetic: {k} -> {v}"
+
+print("PASS: I1 bad merges and dropped words absent, no values with spaces")
 
 # ── Idempotence: d[d[k]] == d[k] ────────────────────────────────────────────
 for k, v in vd.items():
