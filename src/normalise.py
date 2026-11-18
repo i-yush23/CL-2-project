@@ -140,15 +140,8 @@ def _resolve_chains(d: dict[str, str]) -> dict[str, str]:
     return resolved
 
 
-def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], dict[str, int]]:
-    """Build canonical-form dictionary from train tweets only.
-
-    Returns (variant_dict, rejection_counts) where rejection_counts
-    tracks CL-1 rejections by reason.
-    """
-    tag_shares = _compute_tag_shares(train_tweets)
-
-    # Group tokens by phonetic hash
+def _group_by_phonetic_hash(train_tweets: list[dict]) -> dict[str, Counter]:
+    """Group eligible tokens by their phonetic skeleton."""
     hash_to_forms: dict[str, Counter] = defaultdict(Counter)
     for tweet in train_tweets:
         for tok, tag in zip(tweet['tokens'], tweet['tags']):
@@ -156,49 +149,43 @@ def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], 
             if (cleaned and cleaned not in ('<url>', '<user>') and
                     cleaned.isalpha() and len(cleaned) >= MIN_TOKEN_LEN):
                 hash_to_forms[get_phonetic_hash(cleaned)][cleaned] += 1
+    return hash_to_forms
 
+
+def _learn_variants(hash_to_forms: dict[str, Counter], tag_shares: dict) -> dict[str, str]:
+    """Learn variant-to-canonical merges within phonetic hash groups."""
     learned: dict[str, str] = {}
-
     for ph, form_counts in hash_to_forms.items():
-        # Filter to forms passing Hin guard with minimum frequency
         passing = {f: c for f, c in form_counts.items()
                    if _passes_hin_guard(f, tag_shares) and
                    not _is_eng_blocklisted(f, tag_shares) and
                    c >= MIN_VARIANT_FREQ}
         if len(passing) < 2:
             continue
-
-        # Canonical = most frequent passing form
         canonical = max(passing, key=lambda f: passing[f])
-        if passing[canonical] < MIN_CANON_FREQ:
+        if passing[canonical] < MIN_CANON_FREQ or len(canonical) < MIN_TOKEN_LEN:
             continue
-        if len(canonical) < MIN_TOKEN_LEN:
-            continue
-
         for form in passing:
-            if form == canonical:
+            if form == canonical or len(form) < MIN_TOKEN_LEN or form in NEVER_SOURCE:
                 continue
-            if len(form) < MIN_TOKEN_LEN:
-                continue
-            if form in NEVER_SOURCE:
-                continue
-            # Frequency guard: canonical frequency must dominate source frequency
             if passing[canonical] < MIN_FREQ_RATIO * passing[form]:
                 continue
             if (form, canonical) in BLOCKED_MERGES:
                 continue
-            # Similarity check
-            ratio = difflib.SequenceMatcher(None, form, canonical).ratio()
-            if ratio < SIMILARITY_MIN:
+            if difflib.SequenceMatcher(None, form, canonical).ratio() < SIMILARITY_MIN:
                 continue
             learned[form] = canonical
+    return learned
 
-    source_origin: dict[str, str] = {k: 'learned' for k in learned}
 
-    # Load CL-1 background dictionaries with guards
+def _add_cl1_entries(
+    learned: dict[str, str], tag_shares: dict
+) -> tuple[dict[str, str], dict[str, int], dict[str, str]]:
+    """Merge in CL-1 variants and slang mappings with guards."""
     cl1_variants = load_transliteration_variants()
     cl1_slang = load_slang_map()
     rejections: dict[str, int] = defaultdict(int)
+    source_origin: dict[str, str] = {k: 'learned' for k in learned}
 
     for label, cl1_dict in [('cl1_variants', cl1_variants), ('cl1_slang', cl1_slang)]:
         for src, tgt in cl1_dict.items():
@@ -211,34 +198,38 @@ def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], 
             if src in CL1_EXPLICIT_DROP or tgt in CL1_EXPLICIT_DROP:
                 rejections[f'{label}_explicit_drop'] += 1
                 continue
-            # Min length 3 applies unless in ALLOW_SHORT
             if len(src) < MIN_TOKEN_LEN and src not in ALLOW_SHORT:
                 rejections[f'{label}_src_too_short'] += 1
                 continue
             if len(tgt) < MIN_TOKEN_LEN and tgt not in ALLOW_SHORT:
                 rejections[f'{label}_tgt_too_short'] += 1
                 continue
-            # Target must be single alphabetic token with no spaces
             if ' ' in tgt or not tgt.isalpha():
                 rejections[f'{label}_tgt_not_single_alpha'] += 1
                 continue
             if _is_eng_blocklisted(src, tag_shares):
                 rejections[f'{label}_src_eng_majority'] += 1
                 continue
-            # Target must pass the same Hin-share guard as learned entries
             if not _passes_hin_guard(tgt, tag_shares):
                 rejections[f'{label}_tgt_fails_hin_guard'] += 1
                 continue
             learned[src] = tgt
             source_origin[src] = label
 
-    # Resolve chains
+    return learned, dict(rejections), source_origin
+
+
+def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], dict[str, int]]:
+    """Build canonical-form dictionary from train tweets only."""
+    tag_shares = _compute_tag_shares(train_tweets)
+    hash_to_forms = _group_by_phonetic_hash(train_tweets)
+    learned = _learn_variants(hash_to_forms, tag_shares)
+    learned, rejections, source_origin = _add_cl1_entries(learned, tag_shares)
     learned = _resolve_chains(learned)
     build_variant_dictionary.source_origin = {
         k: source_origin.get(k, 'learned') for k in learned
     }
-
-    return learned, dict(rejections)
+    return learned, rejections
 
 
 def normalise_tokens(tokens: list[str], variant_dict: dict[str, str]) -> list[str]:
