@@ -1,10 +1,13 @@
 metric,value
-entries,1048
+entries,1031
 distinct_canonicals,371
+entries_learned,993
+entries_cl1_variants,38
+entries_cl1_slang,0
 train_tokens_total,365560
-train_tokens_changed,7981
+train_tokens_changed,7895
 dev_tokens_total,78678
-dev_tokens_changed,1651
+dev_tokens_changed,1633
 cl1_rejection_cl1_slang_already_learned,1
 cl1_rejection_cl1_slang_explicit_drop,6
 cl1_rejection_cl1_slang_src_eng_majority,11

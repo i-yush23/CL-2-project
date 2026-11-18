@@ -25,6 +25,11 @@ SIMILARITY_MIN = 0.7     # difflib ratio threshold between source and canonical
 ALLOW_SHORT = {"kr", "jb", "kb", "pr", "pe", "naa", "hn"}
 CL1_EXPLICIT_DROP = {"masti", "mast", "ayyo", "imho", "brb", "lmao", "asap", "q", "k", "h", "ha"}
 BLOCKED_MERGES = {('pyaar', 'par'), ('pyar', 'par'), ('haan', 'hain'), ('khana', 'kahan'), ('jane', 'jaan')}
+# hand-curated after inspection of the train-built dictionary
+NEVER_SOURCE = {
+    'pyara', 'pyare', 'pyari', 'piyar', 'kahani', 'kahaani', 'khani', 'khaani',
+    'khaana', 'nahane', 'kaur', 'kyari', 'kayar', 'jaana', 'jaanna', 'jaanne', 'jaanay',
+}
 SEED = 42
 
 # ── Regexes ──────────────────────────────────────────────────────────────────
@@ -175,6 +180,8 @@ def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], 
                 continue
             if len(form) < MIN_TOKEN_LEN:
                 continue
+            if form in NEVER_SOURCE:
+                continue
             # Frequency guard: canonical frequency must dominate source frequency
             if passing[canonical] < MIN_FREQ_RATIO * passing[form]:
                 continue
@@ -186,6 +193,8 @@ def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], 
                 continue
             learned[form] = canonical
 
+    source_origin: dict[str, str] = {k: 'learned' for k in learned}
+
     # Load CL-1 background dictionaries with guards
     cl1_variants = load_transliteration_variants()
     cl1_slang = load_slang_map()
@@ -195,6 +204,9 @@ def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], 
         for src, tgt in cl1_dict.items():
             if src in learned:
                 rejections[f'{label}_already_learned'] += 1
+                continue
+            if src in NEVER_SOURCE:
+                rejections[f'{label}_never_source'] += 1
                 continue
             if src in CL1_EXPLICIT_DROP or tgt in CL1_EXPLICIT_DROP:
                 rejections[f'{label}_explicit_drop'] += 1
@@ -218,9 +230,13 @@ def build_variant_dictionary(train_tweets: list[dict]) -> tuple[dict[str, str], 
                 rejections[f'{label}_tgt_fails_hin_guard'] += 1
                 continue
             learned[src] = tgt
+            source_origin[src] = label
 
     # Resolve chains
     learned = _resolve_chains(learned)
+    build_variant_dictionary.source_origin = {
+        k: source_origin.get(k, 'learned') for k in learned
+    }
 
     return learned, dict(rejections)
 
@@ -246,6 +262,11 @@ def compute_normalisation_stats(
     entries = len(variant_dict)
     distinct_canonicals = len(set(variant_dict.values()))
 
+    origin = getattr(build_variant_dictionary, 'source_origin', {})
+    entries_learned = sum(1 for k in variant_dict if origin.get(k) == 'learned')
+    entries_cl1_variants = sum(1 for k in variant_dict if origin.get(k) == 'cl1_variants')
+    entries_cl1_slang = sum(1 for k in variant_dict if origin.get(k) == 'cl1_slang')
+
     def count_changes(tweets):
         total, changed = 0, 0
         for tweet in tweets:
@@ -253,8 +274,7 @@ def compute_normalisation_stats(
                 total += 1
                 cleaned = clean_token(tok)
                 normalised = variant_dict.get(cleaned, cleaned)
-                # Exclude case-only changes
-                if normalised != cleaned and normalised.lower() != cleaned.lower():
+                if normalised != cleaned:
                     changed += 1
         return total, changed
 
@@ -263,6 +283,9 @@ def compute_normalisation_stats(
     return {
         'entries': entries,
         'distinct_canonicals': distinct_canonicals,
+        'entries_learned': entries_learned,
+        'entries_cl1_variants': entries_cl1_variants,
+        'entries_cl1_slang': entries_cl1_slang,
         'train_total': train_total,
         'train_changed': train_changed,
         'dev_total': dev_total,
@@ -289,6 +312,9 @@ def save_normalisation_stats(
     rows = [
         {'metric': 'entries', 'value': stats['entries']},
         {'metric': 'distinct_canonicals', 'value': stats['distinct_canonicals']},
+        {'metric': 'entries_learned', 'value': stats['entries_learned']},
+        {'metric': 'entries_cl1_variants', 'value': stats['entries_cl1_variants']},
+        {'metric': 'entries_cl1_slang', 'value': stats['entries_cl1_slang']},
         {'metric': 'train_tokens_total', 'value': stats['train_total']},
         {'metric': 'train_tokens_changed', 'value': stats['train_changed']},
         {'metric': 'dev_tokens_total', 'value': stats['dev_total']},
@@ -327,7 +353,12 @@ def save_normalisation_stats(
 
 def get_cache_key(smoke: bool = False) -> str:
     """Hash of normalisation constants + smoke flag for cache keying."""
-    key_str = f"{MIN_CANON_FREQ}_{MIN_VARIANT_FREQ}_{MIN_FREQ_RATIO}_{MIN_TOKEN_LEN}_{HIN_SHARE_MIN}_{ENG_SHARE_MAX}_{ENG_BLOCKLIST_THRESH}_{SIMILARITY_MIN}_{smoke}"
+    key_str = (
+        f"{MIN_CANON_FREQ}_{MIN_VARIANT_FREQ}_{MIN_FREQ_RATIO}_{MIN_TOKEN_LEN}_"
+        f"{HIN_SHARE_MIN}_{ENG_SHARE_MAX}_{ENG_BLOCKLIST_THRESH}_{SIMILARITY_MIN}_{smoke}_"
+        f"{','.join(sorted(ALLOW_SHORT))}_{','.join(sorted(CL1_EXPLICIT_DROP))}_"
+        f"{','.join(sorted(f'{s}:{c}' for s, c in BLOCKED_MERGES))}_{','.join(sorted(NEVER_SOURCE))}"
+    )
     return hashlib.md5(key_str.encode()).hexdigest()[:8]
 
 

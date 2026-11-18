@@ -18,13 +18,18 @@ import pandas as pd
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 from src.data_io import load_dataset
-from src.normalise import clean_token, build_variant_dictionary, normalise_tokens
+from src.normalise import clean_token, build_variant_dictionary, normalise_tokens, get_cache_key
 from src.lid import NaiveBayesLID, TAG_MAP, LID_LABELS, predict_tweets
 
 CACHE_DIR = "results/cache"
 
 
-def load_model(name: str) -> NaiveBayesLID:
+def load_model(name: str, cache_key: str = None) -> NaiveBayesLID:
+    if cache_key:
+        path = os.path.join(CACHE_DIR, f"lid_{name}_{cache_key}.pkl")
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                return pickle.load(f)
     path = os.path.join(CACHE_DIR, f"lid_{name}.pkl")
     with open(path, 'rb') as f:
         return pickle.load(f)
@@ -38,15 +43,19 @@ def run_error_analysis() -> None:
     for tweet in dev_tweets:
         tweet['cleaned_tokens'] = [clean_token(t) for t in tweet['tokens']]
 
-    variant_dict_path = os.path.join(CACHE_DIR, "variant_dict.pkl")
+    cache_key = get_cache_key(False)
+    variant_dict_path = os.path.join(CACHE_DIR, f"variant_dict_{cache_key}.pkl")
+    if not os.path.exists(variant_dict_path):
+        variant_dict_path = os.path.join(CACHE_DIR, "variant_dict.pkl")
     with open(variant_dict_path, 'rb') as f:
-        variant_dict = pickle.load(f)
+        data = pickle.load(f)
+        variant_dict = data[0] if isinstance(data, tuple) else data
 
     for tweet in dev_tweets:
         tweet['normalised_tokens'] = normalise_tokens(tweet['tokens'], variant_dict)
 
-    model_raw = load_model('raw')
-    model_norm = load_model('normalised')
+    model_raw = load_model('raw', cache_key)
+    model_norm = load_model('normalised', cache_key)
 
     preds_raw  = predict_tweets(model_raw,  dev_tweets, 'tokens')
     preds_norm = predict_tweets(model_norm, dev_tweets, 'normalised_tokens')

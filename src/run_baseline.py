@@ -30,7 +30,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 from sklearn.linear_model import LogisticRegression
 
 from src.data_io import load_dataset
-from src.normalise import clean_token, build_variant_dictionary, normalise_tokens
+from src.normalise import clean_token, build_variant_dictionary, normalise_tokens, get_cache_key
 from src.lid import NaiveBayesLID, predict_tweets, TAG_MAP
 from src.features import F1Builder, F2Builder, F3Builder, F4Builder, F5Builder
 from src.eval_utils import (
@@ -202,27 +202,33 @@ def main(smoke_test: bool = False) -> None:
     add_cleaned(train_tweets)
     add_cleaned(dev_tweets)
 
-    variant_dict_path = os.path.join(CACHE_DIR, "variant_dict.pkl")
+    cache_key = get_cache_key(smoke_test)
+    variant_dict_path = os.path.join(CACHE_DIR, f"variant_dict_{cache_key}.pkl")
     if os.path.exists(variant_dict_path):
         with open(variant_dict_path, 'rb') as f:
-            variant_dict = pickle.load(f)
+            data = pickle.load(f)
+            variant_dict, rejections = data if isinstance(data, tuple) else (data, {})
     else:
-        variant_dict = build_variant_dictionary(train_tweets)
+        variant_dict, rejections = build_variant_dictionary(train_tweets)
         with open(variant_dict_path, 'wb') as f:
-            pickle.dump(variant_dict, f)
+            pickle.dump((variant_dict, rejections), f)
 
     add_normalised(train_tweets, variant_dict)
     add_normalised(dev_tweets, variant_dict)
 
     # Load LID model (normalised condition)
-    lid_model_path = os.path.join(CACHE_DIR, "lid_normalised.pkl")
+    lid_model_path = os.path.join(CACHE_DIR, f"lid_normalised_{cache_key}.pkl")
+    if not os.path.exists(lid_model_path):
+        lid_model_path = os.path.join(CACHE_DIR, "lid_normalised.pkl")
     if os.path.exists(lid_model_path):
         with open(lid_model_path, 'rb') as f:
             lid_model = pickle.load(f)
         print(f"Loaded LID model from {lid_model_path}")
     else:
         # Fallback: use raw model
-        lid_model_path = os.path.join(CACHE_DIR, "lid_raw.pkl")
+        lid_model_path = os.path.join(CACHE_DIR, f"lid_raw_{cache_key}.pkl")
+        if not os.path.exists(lid_model_path):
+            lid_model_path = os.path.join(CACHE_DIR, "lid_raw.pkl")
         with open(lid_model_path, 'rb') as f:
             lid_model = pickle.load(f)
         print(f"Loaded fallback LID model from {lid_model_path}")

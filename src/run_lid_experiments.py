@@ -131,13 +131,14 @@ def main(smoke_test: bool = False) -> None:
     if os.path.exists(variant_dict_path):
         with open(variant_dict_path, 'rb') as f:
             import pickle
-            variant_dict = pickle.load(f)
+            data = pickle.load(f)
+            variant_dict, rejections = data if isinstance(data, tuple) else (data, {})
         print(f"  Loaded cached variant dict ({len(variant_dict)} entries).")
     else:
-        variant_dict, _ = build_variant_dictionary(train_tweets)
+        variant_dict, rejections = build_variant_dictionary(train_tweets)
         with open(variant_dict_path, 'wb') as f:
             import pickle
-            pickle.dump(variant_dict, f)
+            pickle.dump((variant_dict, rejections), f)
         print(f"  Built variant dict ({len(variant_dict)} entries).")
 
     print("Adding normalised tokens...")
