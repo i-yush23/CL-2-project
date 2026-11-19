@@ -22,9 +22,9 @@ For Phase 4 we train in three conditions:
 import os
 import pickle
 import math
-from collections import defaultdict, Counter
+from collections import Counter
 
-from src.cl1 import get_phonetic_hash
+from src.normalise import URL_RE, MENTION_RE
 
 # Mapping from SentiMix gold tags to our LID label set
 TAG_MAP = {
@@ -48,9 +48,18 @@ def _char_ngrams(word: str, n_min: int, n_max: int) -> list[str]:
     return ngrams
 
 
+def _is_language_independent(tok: str) -> bool:
+    """Return True if token contains no letters, or is a URL / mention."""
+    if not tok:
+        return True
+    if tok in ('<url>', '<user>') or URL_RE.fullmatch(tok) or MENTION_RE.fullmatch(tok):
+        return True
+    return not any(c.isalpha() for c in tok)
+
+
 class NaiveBayesLID:
     """
-    Character n-gram Naive Bayes LID with phonetic fallback.
+    Character n-gram Naive Bayes LID with context smoothing, no phonetic fallback.
     Trains on (token, label) pairs; labels must be in LID_LABELS.
     Context smoothing: use the majority label of neighbour tokens
     to break ties (window=2, weight=0.1).
@@ -64,8 +73,6 @@ class NaiveBayesLID:
         self.ngram_counts: dict[str, dict[str, int]] = {}
         self.vocab: set[str] = set()
         self.total_ngrams: dict[str, int] = {}
-        # Phonetic hash -> majority label (fallback)
-        self.phash_label: dict[str, str] = {}
 
     def fit(self, tokens: list[str], labels_seq: list[str]) -> 'NaiveBayesLID':
         """Train on flat lists of tokens and their labels."""
@@ -86,14 +93,6 @@ class NaiveBayesLID:
                 self.ngram_counts[ng][lbl] = self.ngram_counts[ng].get(lbl, 0) + 1
                 self.vocab.add(ng)
             self.total_ngrams[lbl] = self.total_ngrams.get(lbl, 0) + len(ngrams)
-
-        # Phonetic fallback: map each phonetic hash to its majority label
-        phash_label_counts: dict[str, Counter] = defaultdict(Counter)
-        for tok, lbl in zip(tokens, labels_seq):
-            ph = get_phonetic_hash(tok.lower())
-            phash_label_counts[ph][lbl] += 1
-        self.phash_label = {ph: cnt.most_common(1)[0][0]
-                            for ph, cnt in phash_label_counts.items()}
         return self
 
     def _score_token(self, tok: str) -> dict[str, float]:
@@ -120,8 +119,7 @@ class NaiveBayesLID:
 
         raw_scores = []
         for tok in tokens:
-            # Non-alphabetic tokens (numbers, punctuation, emoji) -> O directly
-            if not tok.lower().replace("'", "").isalpha():
+            if _is_language_independent(tok):
                 raw_scores.append({lbl: (1.0 if lbl == 'O' else 0.0) for lbl in self.labels})
             else:
                 raw_scores.append(self._score_token(tok))

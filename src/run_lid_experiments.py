@@ -17,6 +17,8 @@ import pickle
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import pandas as pd
 
+from collections import Counter
+
 from src.data_io import load_dataset
 from src.normalise import (
     clean_token,
@@ -30,6 +32,7 @@ from src.lid import (
     LID_LABELS,
     build_flat_token_label_lists,
     predict_tweets,
+    _is_language_independent,
 )
 from src.eval_utils import (
     compute_metrics,
@@ -37,11 +40,6 @@ from src.eval_utils import (
     plot_confusion_matrix,
     save_dataframe_csv,
 )
-
-CACHE_DIR = "results/cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-os.makedirs("results", exist_ok=True)
-
 
 def add_cleaned_tokens(tweets: list[dict]) -> None:
     """Add 'cleaned_tokens' field to each tweet in-place."""
@@ -67,13 +65,15 @@ def run_condition(
     train_tweets: list[dict],
     dev_tweets: list[dict],
     tokens_key: str,
+    out_dir: str,
+    cache_dir: str,
     smoke_test: bool = False,
-) -> dict:
-    """Train LID, evaluate on dev, save results. Returns metrics dict."""
+) -> tuple[dict, dict]:
+    """Train LID, evaluate on dev, save results. Returns (metrics_dict, rule_stats_dict)."""
     print(f"\n--- Condition: {name} (tokens_key={tokens_key}) ---")
 
     cache_key = get_cache_key(smoke_test)
-    model_path = os.path.join(CACHE_DIR, f"lid_{name}_{cache_key}.pkl")
+    model_path = os.path.join(cache_dir, f"lid_{name}_{cache_key}.pkl")
 
     if os.path.exists(model_path):
         print("  Loading cached model...")
@@ -102,22 +102,44 @@ def run_condition(
     metrics = compute_metrics(y_true, y_pred, labels=LID_LABELS)
     print(f"  Accuracy: {metrics['accuracy']:.4f}  Macro-F1: {metrics['macro_f1']:.4f}")
 
+    # Count tokens routed by O-rule on dev
+    rule_tokens = 0
+    gold_counts = Counter()
+    for tweet in eval_tweets:
+        for tok, tag in zip(tweet[tokens_key], tweet['tags']):
+            if _is_language_independent(tok):
+                rule_tokens += 1
+                gold_counts[TAG_MAP.get(tag, 'O')] += 1
+
+    rule_stats = {
+        'condition': name,
+        'rule_tokens': rule_tokens,
+        'gold_O': gold_counts.get('O', 0),
+        'gold_Hin': gold_counts.get('Hin', 0),
+        'gold_Eng': gold_counts.get('Eng', 0),
+    }
+
     # Save per-class report
     report_df = get_classification_report_df(y_true, y_pred, labels=LID_LABELS)
     report_df.insert(0, 'condition', name)
-    save_dataframe_csv(report_df, f"results/lid_{name}.csv")
+    save_dataframe_csv(report_df, os.path.join(out_dir, f"lid_{name}.csv"))
 
     # Save confusion matrix
     plot_confusion_matrix(
         y_true, y_pred, labels=LID_LABELS,
-        output_path=f"results/lid_{name}.png",
+        output_path=os.path.join(out_dir, f"lid_{name}.png"),
         title=f"LID Confusion Matrix - {name}",
     )
 
-    return {'condition': name, **metrics}
+    return {'condition': name, **metrics}, rule_stats
 
 
 def main(smoke_test: bool = False) -> None:
+    out_dir = "results_smoke" if smoke_test else "results"
+    cache_dir = os.path.join(out_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+
     print("Loading data...")
     train_tweets, dev_tweets = load_dataset()
 
@@ -127,7 +149,7 @@ def main(smoke_test: bool = False) -> None:
 
     print("Building variant dictionary (train only)...")
     cache_key = get_cache_key(smoke_test)
-    variant_dict_path = os.path.join(CACHE_DIR, f"variant_dict_{cache_key}.pkl")
+    variant_dict_path = os.path.join(cache_dir, f"variant_dict_{cache_key}.pkl")
     if os.path.exists(variant_dict_path):
         with open(variant_dict_path, 'rb') as f:
             import pickle
@@ -146,6 +168,7 @@ def main(smoke_test: bool = False) -> None:
     add_normalised_tokens(dev_tweets, variant_dict)
 
     comparison_rows = []
+    rule_rows = []
 
     # Run all three conditions
     for name, key in [
@@ -153,20 +176,22 @@ def main(smoke_test: bool = False) -> None:
         ('cleaned', 'cleaned_tokens'),
         ('normalised', 'normalised_tokens'),
     ]:
-        # Clear cache for smoke test to retrain on subset
-        if smoke_test:
-            cache_key = get_cache_key(smoke_test)
-            model_path = os.path.join(CACHE_DIR, f"lid_{name}_{cache_key}.pkl")
-            if os.path.exists(model_path):
-                os.remove(model_path)
-
-        metrics = run_condition(name, train_tweets, dev_tweets, key, smoke_test=smoke_test)
+        metrics, rule_stats = run_condition(
+            name, train_tweets, dev_tweets, key,
+            out_dir=out_dir, cache_dir=cache_dir, smoke_test=smoke_test
+        )
         comparison_rows.append(metrics)
+        rule_rows.append(rule_stats)
 
     comparison_df = pd.DataFrame(comparison_rows)
-    save_dataframe_csv(comparison_df, "results/lid_comparison.csv")
+    save_dataframe_csv(comparison_df, os.path.join(out_dir, "lid_comparison.csv"))
+    rule_df = pd.DataFrame(rule_rows)
+    save_dataframe_csv(rule_df, os.path.join(out_dir, "lid_rule_stats.csv"))
+
     print("\n=== LID Comparison ===")
     print(comparison_df.to_string(index=False))
+    print("\n=== LID Rule Stats ===")
+    print(rule_df.to_string(index=False))
 
 
 if __name__ == "__main__":
