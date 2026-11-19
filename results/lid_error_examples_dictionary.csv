@@ -1,0 +1,5 @@
+pair,kind,surface,normalised,gold,pred_a,pred_c,count,change_type,token_changed
+raw_vs_norm,helped,Owesi,owaisi,Hin,Eng,Hin,1,dictionary,True
+raw_vs_norm,hurt,issi,iss,Hin,Hin,Eng,1,dictionary,True
+clean_vs_norm,helped,Owesi,owaisi,Hin,Eng,Hin,1,dictionary,True
+clean_vs_norm,hurt,issi,iss,Hin,Hin,Eng,1,dictionary,True
